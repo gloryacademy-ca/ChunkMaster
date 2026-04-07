@@ -2,7 +2,12 @@ import { useState, useEffect } from 'react'
 import { LESSONS_MAP } from '../data/lessons'
 import { getClasses, saveClass, getAllProgress, subscribeAllProgress, createUser } from '../db'
 import { db } from '../firebase'
-import { doc, setDoc, getDoc, collection, getDocs } from 'firebase/firestore'
+import { doc, setDoc, getDoc, collection, getDocs, updateDoc } from 'firebase/firestore'
+
+async function getAllUsers() {
+  const snap = await getDocs(collection(db, 'users'))
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }))
+}
 
 // ─── Chunk splitter (의미 단위) ────────────────────────────
 function getChunks(sentence) {
@@ -156,7 +161,13 @@ function ClassesTab({ classes, onRefresh }) {
   const [saving, setSaving] = useState(false)
   const [selectedLessons, setSelectedLessons] = useState([])
   const [expandedClass, setExpandedClass] = useState(null)
+  const [allUsers, setAllUsers] = useState([])
+  const [assigningUser, setAssigningUser] = useState({})
   const allLessons = Object.values(LESSONS_MAP || {})
+
+  useEffect(() => {
+    getAllUsers().then(users => setAllUsers(users.filter(u => u.role === 'student')))
+  }, [])
 
   async function createClass() {
     if (!newName.trim()) return
@@ -172,6 +183,39 @@ function ClassesTab({ classes, onRefresh }) {
     setSelectedLessons(prev =>
       prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
     )
+  }
+
+  async function assignStudent(cls, userId) {
+    if (!userId) return
+    setAssigningUser(prev => ({ ...prev, [cls.id]: true }))
+    const user = allUsers.find(u => u.id === userId)
+    if (!user) return
+    // update user's classId and assignedLessons
+    await updateDoc(doc(db, 'users', userId), {
+      classId: cls.id,
+      assignedLessons: cls.assignedLessons || []
+    })
+    // update class students list
+    const students = cls.students || []
+    if (!students.includes(user.name)) {
+      await saveClass({ ...cls, students: [...students, user.name] })
+    }
+    // refresh user list
+    const updated = await getAllUsers()
+    setAllUsers(updated.filter(u => u.role === 'student'))
+    await onRefresh()
+    setAssigningUser(prev => ({ ...prev, [cls.id]: false }))
+  }
+
+  async function removeStudent(cls, userId) {
+    const user = allUsers.find(u => u.id === userId)
+    if (!user) return
+    await updateDoc(doc(db, 'users', userId), { classId: null, assignedLessons: [] })
+    const students = (cls.students || []).filter(s => s !== user.name)
+    await saveClass({ ...cls, students })
+    const updated = await getAllUsers()
+    setAllUsers(updated.filter(u => u.role === 'student'))
+    await onRefresh()
   }
 
   return (
@@ -195,27 +239,62 @@ function ClassesTab({ classes, onRefresh }) {
           {saving ? '저장 중...' : '반 만들기'}
         </button>
       </div>
-      {classes.map(cls => (
-        <div key={cls.id} className="bg-white rounded-2xl shadow-sm overflow-hidden">
-          <button onClick={() => setExpandedClass(expandedClass === cls.id ? null : cls.id)}
-            className="w-full flex items-center justify-between px-4 py-3">
-            <div>
-              <div className="font-black text-gray-800">{cls.name}</div>
-              <div className="text-xs text-gray-400">{(cls.assignedLessons || []).length}개 레슨 배정됨</div>
-            </div>
-            <span className="text-gray-400">{expandedClass === cls.id ? '▲' : '▼'}</span>
-          </button>
-          {expandedClass === cls.id && (
-            <div className="px-4 pb-4 border-t border-gray-100 pt-3">
-              <div className="flex flex-wrap gap-1">
-                {(cls.assignedLessons || []).map(id => (
-                  <span key={id} className="text-xs bg-indigo-50 text-indigo-700 font-bold px-2 py-1 rounded-lg">L{id}</span>
-                ))}
+      {classes.map(cls => {
+        const classStudents = allUsers.filter(u => u.classId === cls.id)
+        const unassigned = allUsers.filter(u => !u.classId)
+        return (
+          <div key={cls.id} className="bg-white rounded-2xl shadow-sm overflow-hidden">
+            <button onClick={() => setExpandedClass(expandedClass === cls.id ? null : cls.id)}
+              className="w-full flex items-center justify-between px-4 py-3">
+              <div>
+                <div className="font-black text-gray-800">{cls.name}</div>
+                <div className="text-xs text-gray-400">{(cls.assignedLessons || []).length}개 레슨 · 학생 {classStudents.length}명</div>
               </div>
-            </div>
-          )}
-        </div>
-      ))}
+              <span className="text-gray-400">{expandedClass === cls.id ? '▲' : '▼'}</span>
+            </button>
+            {expandedClass === cls.id && (
+              <div className="px-4 pb-4 border-t border-gray-100 pt-3 space-y-3">
+                <div className="flex flex-wrap gap-1">
+                  {(cls.assignedLessons || []).map(id => (
+                    <span key={id} className="text-xs bg-indigo-50 text-indigo-700 font-bold px-2 py-1 rounded-lg">L{id}</span>
+                  ))}
+                </div>
+                <div className="text-xs font-bold text-gray-500 mt-2">📋 학생 목록</div>
+                {classStudents.length === 0 ? (
+                  <p className="text-xs text-gray-400">아직 배정된 학생이 없어요</p>
+                ) : classStudents.map(u => (
+                  <div key={u.id} className="flex items-center justify-between bg-gray-50 rounded-xl px-3 py-2">
+                    <span className="text-sm font-bold text-gray-700">👤 {u.name}</span>
+                    <button onClick={() => removeStudent(cls, u.id)}
+                      className="text-xs text-red-500 font-bold px-2 py-1 bg-red-50 rounded-lg">삭제</button>
+                  </div>
+                ))}
+                {unassigned.length > 0 && (
+                  <div className="flex gap-2 mt-2">
+                    <select id={`sel-${cls.id}`}
+                      className="flex-1 border border-gray-200 rounded-xl px-3 py-2 text-sm outline-none">
+                      <option value="">학생 선택...</option>
+                      {unassigned.map(u => (
+                        <option key={u.id} value={u.id}>{u.name}</option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={() => {
+                        const sel = document.getElementById(`sel-${cls.id}`)
+                        assignStudent(cls, sel.value)
+                        sel.value = ''
+                      }}
+                      disabled={assigningUser[cls.id]}
+                      className="bg-indigo-600 text-white text-xs font-black px-4 py-2 rounded-xl disabled:bg-gray-300">
+                      {assigningUser[cls.id] ? '...' : '+ 추가'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
